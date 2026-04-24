@@ -438,11 +438,7 @@ async fn connect(
             .await;
     }
 
-    // Временно отключаем роутер для тестирования
     println!("[TEST] Would add IP {} to router RDP list", req.external_ip);
-    // state.mikrotik.add_ip_to_rdp_list(&req.external_ip)
-    //     .await
-    //     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Router error: {}", e)}))))?;
 
     let connection = Connection {
         id: None,
