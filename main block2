@@ -1,0 +1,515 @@
+use axum::{
+    Router, routing::{get, post, put, delete}, Json, extract::State, http::StatusCode,
+};
+use mongodb::{
+    Client as MongoClient, Collection, Database,
+    bson::{doc, oid::ObjectId},
+};
+use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
+use reqwest::Client as HttpClient;
+use std::sync::Arc;
+use chrono::Utc;
+use base64::prelude::*;
+use futures_util::stream::TryStreamExt;
+
+//МОДЕЛИ
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub last_name: String,
+    pub first_name: String,
+    pub login: String,
+    pub password_hash: String,
+    pub created_at: i64,
+    pub created_by: String,
+    pub updated_at: i64,
+    pub updated_by: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workstation {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub ip_address: String,
+    pub router_port: u16,
+    pub allowed_users: Vec<String>,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Connection {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub user_login: String,
+    pub user_external_ip: String,
+    pub workstation_id: ObjectId,
+    pub created_at: i64,
+    pub deleted: bool,
+    pub deleted_at: Option<i64>,
+}
+
+//DTO
+
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub last_name: String,
+    pub first_name: String,
+    pub login: String,
+    pub password: String,
+    pub created_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserRequest {
+    pub last_name: Option<String>,
+    pub first_name: Option<String>,
+    pub password: Option<String>,
+    pub updated_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateWorkstationRequest {
+    pub ip_address: String,
+    pub router_port: u16,
+    pub allowed_users: Vec<String>,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateWorkstationRequest {
+    pub ip_address: Option<String>,
+    pub router_port: Option<u16>,
+    pub allowed_users: Option<Vec<String>>,
+    pub max_connections: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectRequest {
+    pub login: String,
+    pub password: String,
+    pub external_ip: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectResponse {
+    pub rdp_string: String,
+}
+
+//AUTH
+
+fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    hash_password(password) == hash
+}
+
+//MIKROTIK CLIENT
+
+const ROUTER_IP: &str = "188.242.27.197";
+const ROUTER_USER: &str = "test";
+const ROUTER_PASS: &str = "MsRus4215";
+const ROUTER_EXTERNAL_IP: &str = "188.242.27.197";
+
+struct MikroTikClient {
+    client: HttpClient,
+    auth_header: String,
+    base_url: String,
+}
+
+impl MikroTikClient {
+    fn new() -> Self {
+        let auth = format!("{}:{}", ROUTER_USER, ROUTER_PASS);
+        let auth_header = format!("Basic {}", BASE64_STANDARD.encode(&auth));
+
+        let client = HttpClient::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        Self {
+            client,
+            auth_header,
+            base_url: format!("http://{}/rest", ROUTER_IP),
+        }
+    }
+
+    async fn add_ip_to_rdp_list(&self, ip: &str) -> Result<(), String> {
+        let url = format!("{}/ip/firewall/address-list", self.base_url);
+
+        let body = serde_json::json!({
+            "address": ip,
+            "list": "rdp",
+            "timeout": "1d"
+        });
+
+        let response = self.client
+            .put(&url)
+            .header("Authorization", &self.auth_header)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {}", e))?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        Err(format!("MikroTik error: {}", response.text().await.unwrap_or_default()))
+    }
+
+    async fn remove_ip_from_rdp_list(&self, ip: &str) -> Result<(), String> {
+        let find_url = format!("{}/ip/firewall/address-list?list=rdp", self.base_url);
+
+        let response = self.client
+            .get(&find_url)
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {}", e))?;
+
+        if response.status().is_success() {
+            let data: Vec<serde_json::Value> = response.json().await.unwrap_or_default();
+            for entry in data {
+                if let Some(addr) = entry.get("address").and_then(|v| v.as_str()) {
+                    if addr == ip {
+                        if let Some(id) = entry.get(".id").and_then(|v| v.as_str()) {
+                            let delete_url = format!("{}/ip/firewall/address-list/{}", self.base_url, id);
+                            let _ = self.client
+                                .delete(&delete_url)
+                                .header("Authorization", &self.auth_header)
+                                .send()
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+//APP STATE
+
+struct AppState {
+    users: Collection<User>,
+    workstations: Collection<Workstation>,
+    connections: Collection<Connection>,
+    mikrotik: MikroTikClient,
+}
+
+impl AppState {
+    async fn new(db: &Database) -> Self {
+        Self {
+            users: db.collection("users"),
+            workstations: db.collection("workstations"),
+            connections: db.collection("connections"),
+            mikrotik: MikroTikClient::new(),
+        }
+    }
+}
+
+//HANDLERS
+
+async fn get_time() -> String {
+    time::OffsetDateTime::now_utc().to_string()
+}
+
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateUserRequest>,
+) -> StatusCode {
+    let now = Utc::now().timestamp_millis();
+
+    let user = User {
+        id: None,
+        last_name: req.last_name,
+        first_name: req.first_name,
+        login: req.login,
+        password_hash: hash_password(&req.password),
+        created_at: now,
+        created_by: req.created_by.clone(),
+        updated_at: now,
+        updated_by: req.created_by,
+        deleted: false,
+    };
+
+    match state.users.insert_one(user, None).await {
+        Ok(_) => StatusCode::CREATED,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn update_user(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(login): axum::extract::Path<String>,
+    Json(req): Json<UpdateUserRequest>,
+) -> StatusCode {
+    let mut update_doc = doc! {};
+    let now = Utc::now().timestamp_millis();
+
+    if let Some(last_name) = req.last_name {
+        update_doc.insert("last_name", last_name);
+    }
+    if let Some(first_name) = req.first_name {
+        update_doc.insert("first_name", first_name);
+    }
+    if let Some(password) = req.password {
+        update_doc.insert("password_hash", hash_password(&password));
+    }
+    update_doc.insert("updated_at", now);
+    update_doc.insert("updated_by", req.updated_by);
+
+    let result = state.users
+        .update_one(doc! { "login": &login, "deleted": false }, doc! { "$set": update_doc }, None)
+        .await;
+
+    match result {
+        Ok(updated) if updated.modified_count > 0 => StatusCode::OK,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(login): axum::extract::Path<String>,
+) -> StatusCode {
+    let mut cursor = match state.connections
+        .find(doc! { "user_login": &login, "deleted": false }, None)
+        .await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    while let Ok(Some(conn)) = cursor.try_next().await {
+        let _ = state.mikrotik.remove_ip_from_rdp_list(&conn.user_external_ip).await;
+
+        let _ = state.connections
+            .update_one(
+                doc! { "_id": conn.id.unwrap() },
+                doc! { "$set": { "deleted": true, "deleted_at": Utc::now().timestamp_millis() } },
+                None
+            )
+            .await;
+    }
+
+    let result = state.users
+        .update_one(
+            doc! { "login": &login, "deleted": false },
+            doc! { "$set": { "deleted": true, "updated_at": Utc::now().timestamp_millis() } },
+            None
+        )
+        .await;
+
+    match result {
+        Ok(updated) if updated.modified_count > 0 => StatusCode::OK,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn create_workstation(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateWorkstationRequest>,
+) -> StatusCode {
+    let workstation = Workstation {
+        id: None,
+        ip_address: req.ip_address,
+        router_port: req.router_port,
+        allowed_users: req.allowed_users,
+        max_connections: req.max_connections,
+    };
+
+    match state.workstations.insert_one(workstation, None).await {
+        Ok(_) => StatusCode::CREATED,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn update_workstation(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<UpdateWorkstationRequest>,
+) -> StatusCode {
+    let object_id = match ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    let mut update_doc = doc! {};
+
+    if let Some(ip_address) = req.ip_address {
+        update_doc.insert("ip_address", ip_address);
+    }
+    if let Some(router_port) = req.router_port {
+        update_doc.insert("router_port", router_port as i32);
+    }
+    if let Some(allowed_users) = req.allowed_users {
+        update_doc.insert("allowed_users", allowed_users);
+    }
+    if let Some(max_connections) = req.max_connections {
+        update_doc.insert("max_connections", max_connections as i32);
+    }
+
+    let result = state.workstations
+        .update_one(doc! { "_id": object_id }, doc! { "$set": update_doc }, None)
+        .await;
+
+    match result {
+        Ok(updated) if updated.modified_count > 0 => StatusCode::OK,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn delete_workstation(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> StatusCode {
+    let object_id = match ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    match state.workstations.delete_one(doc! { "_id": object_id }, None).await {
+        Ok(deleted) if deleted.deleted_count > 0 => StatusCode::OK,
+        Ok(_) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn connect(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ConnectRequest>,
+) -> Result<Json<ConnectResponse>, (StatusCode, Json<serde_json::Value>)> {
+
+    let user = state.users
+        .find_one(doc! { "login": &req.login, "deleted": false }, None)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"}))))?;
+
+    let user = match user {
+        Some(u) => u,
+        None => {
+            return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid login or password"}))));
+        }
+    };
+
+    if !verify_password(&req.password, &user.password_hash) {
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid login or password"}))));
+    }
+
+    let workstation = state.workstations
+        .find_one(doc! { "allowed_users": &req.login }, None)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"}))))?;
+
+    let workstation = match workstation {
+        Some(w) => w,
+        None => {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No workstation assigned. Contact administrator."}))));
+        }
+    };
+
+    let mut cursor = state.connections
+        .find(doc! { "user_login": &req.login, "deleted": false }, None)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"}))))?;
+
+    while let Ok(Some(conn)) = cursor.try_next().await {
+        let _ = state.mikrotik.remove_ip_from_rdp_list(&conn.user_external_ip).await;
+
+        let _ = state.connections
+            .update_one(
+                doc! { "_id": conn.id.unwrap() },
+                doc! { "$set": { "deleted": true, "deleted_at": Utc::now().timestamp_millis() } },
+                None
+            )
+            .await;
+    }
+
+    // Временно отключаем роутер для тестирования
+    println!("[TEST] Would add IP {} to router RDP list", req.external_ip);
+    // state.mikrotik.add_ip_to_rdp_list(&req.external_ip)
+    //     .await
+    //     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Router error: {}", e)}))))?;
+
+    let connection = Connection {
+        id: None,
+        user_login: req.login.clone(),
+        user_external_ip: req.external_ip.clone(),
+        workstation_id: workstation.id.unwrap(),
+        created_at: Utc::now().timestamp_millis(),
+        deleted: false,
+        deleted_at: None,
+    };
+
+    state.connections
+        .insert_one(connection, None)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to save connection"}))))?;
+
+    let rdp_string = format!("{}:{}", ROUTER_EXTERNAL_IP, workstation.router_port);
+
+    Ok(Json(ConnectResponse { rdp_string }))
+}
+
+//MAIN
+
+#[tokio::main]
+async fn main() {
+    let mongo_client = MongoClient::with_uri_str("mongodb://localhost:27017")
+        .await
+        .expect("Failed to connect to MongoDB");
+
+    let db = mongo_client.database("322");
+
+    let users_collection: Collection<User> = db.collection("users");
+    let _ = users_collection.create_index(mongodb::IndexModel::builder()
+                                              .keys(doc! { "login": 1 })
+                                              .options(mongodb::options::IndexOptions::builder().unique(true).build())
+                                              .build(), None).await;
+
+    let state = Arc::new(AppState::new(&db).await);
+
+    let app = Router::new()
+        .route("/time", get(get_time))
+        .route("/users", post(create_user))
+        .route("/users/:login", put(update_user))
+        .route("/users/:login", delete(delete_user))
+        .route("/workstations", post(create_workstation))
+        .route("/workstations/:id", put(update_workstation))
+        .route("/workstations/:id", delete(delete_workstation))
+        .route("/connect", post(connect))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:5000")
+        .await
+        .unwrap();
+
+    println!("Server running on http://localhost:5000");
+    println!("");
+    println!("ENDPOINTS:");
+    println!("  GET    /time");
+    println!("  POST   /users");
+    println!("  PUT    /users/:login");
+    println!("  DELETE /users/:login");
+    println!("  POST   /workstations");
+    println!("  PUT    /workstations/:id");
+    println!("  DELETE /workstations/:id");
+    println!("  POST   /connect");
+
+    axum::serve(listener, app)
+        .await
+        .unwrap();
+}
