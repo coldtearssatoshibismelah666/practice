@@ -7,7 +7,7 @@ async fn get_time() -> String {
 
 async fn save_time(Json(data): Json<serde_json::Value>) -> String {
     let client = mongodb::Client::with_uri_str("mongodb://localhost:27017").await.unwrap();
-    let db = client.database("my_app");
+    let db = client.database("322");
     let collection = db.collection("data");
     let doc = doc! { "time": data["timestamp"].as_str().unwrap() };
     collection.insert_one(doc).await.unwrap();
