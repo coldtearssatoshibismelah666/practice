@@ -1,0 +1,28 @@
+use axum::{Router, routing::get, routing::post, Json};
+use mongodb::bson::doc;
+
+async fn get_time() -> String {
+    time::OffsetDateTime::now_utc().to_string()
+}
+
+async fn save_time(Json(data): Json<serde_json::Value>) -> String {
+    let client = mongodb::Client::with_uri_str("mongodb://localhost:27017").await.unwrap();
+    let db = client.database("my_app");
+    let collection = db.collection("data");
+    let doc = doc! { "time": data["timestamp"].as_str().unwrap() };
+    collection.insert_one(doc).await.unwrap();
+    "Ok".to_string()
+}
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/time", get(get_time))
+        .route("/save", post(save_time));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:5000")
+        .await
+        .unwrap();
+    println!("Server on http://localhost:5000");
+    axum::serve(listener, app)
+        .await
+        .unwrap();
+}
